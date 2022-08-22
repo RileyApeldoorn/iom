@@ -1,5 +1,4 @@
 //! Lazily evaluated monadic IO actions.
-#![feature(type_alias_impl_trait)]
 
 use std::{ io::{ Read, Result, Write }, path::Path, mem, fs };
 use Inner::{ Eval, Pure, Done };
