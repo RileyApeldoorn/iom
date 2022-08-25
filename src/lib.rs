@@ -1,26 +1,31 @@
 //! Lazily evaluated monadic IO actions.
 
-use std::{ io::{ Read, Result, Write }, path::Path, mem, fs, marker::PhantomData };
-use Inner::{ Eval, Pure, Done };
+use std::{ io::{ Read, Result, Write }, path::Path, mem, fs, marker::PhantomData, fmt::Display };
+use Inner::{ Chain, Pure, Expended };
 
 /// A chain of lazy, composable IO actions.
 pub struct IO <'a, O = ()> (Inner<'a, O>);
 
+/// The *actual* IO machinery.
 enum Inner <'a, O> {
-    Eval (Box<dyn Action<'a, Output = O> + 'a>),
+    /// One or more chained IO actions that have not been performed yet.
+    Chain (Box<dyn Action<'a, Output = O> + 'a>),
+    /// There are no side effects to perform (memory aid: no side effects = pure).
     Pure (O),
-    Done,
+    /// The side effects have already been performed. If you encounter this
+    /// variant, you should panic.
+    Expended,
 }
 
 /// Primitive for [`IO`]. This is the "unsafe", lower level interface that can be
-/// abused (if it weren't for other safety precautions such as the `Context` being
+/// abused (if it weren't for other safety precautions such as the [`Context`] being
 /// private).
 trait Action<'a> {
-    /// The value the action will evaluate to.
+    /// The value the action will evaluate to after performing side effects.
     type Output: 'a;
-    /// Attempts to perform an [`Action`] more than once is generally cause for
-    /// panic. Unfortunately due to the way trait objects work, this is impossible
-    /// to express using move semantics.
+    /// Attempts to perform an [`Action`] more than once is always cause for panic.
+    /// Unfortunately due to the way trait objects work, this is impossible to express
+    /// using move semantics.
     ///
     /// The solution is to hide the mutable-reference-shenanigans behind an
     /// interface that does use ownership. This interface is [`IO`]. If we need to
@@ -36,8 +41,8 @@ where
 {
     type Output = T;
     fn perform (&mut self, cx: Context<'_>) -> Result<T> {
-        match mem::replace(self, Done) {
-            Eval (mut a) => a.perform(cx),
+        match mem::replace(self, Expended) {
+            Chain (mut a) => a.perform(cx),
             Pure (v) => Ok (v),
             _ => panic!("Re-evaluation of IO action!"),
         }
@@ -61,8 +66,8 @@ impl IO<'_> {
     pub fn run (IO (inner): IO<'_>) -> Result<()> {
         // We only have to perform an action when `inner` is [`Eval`].
         let mut action = match inner {
-            Done | Pure (_) => return Ok (()),
-            Eval (action) => action,
+            Expended | Pure (_) => return Ok (()),
+            Chain (action) => action,
         };
 
         // Construct a new `Context` for the action.
@@ -76,11 +81,14 @@ impl IO<'_> {
 
     /// Perform the IO action and return anything printed to stdout
     /// as a string.
+    ///
+    /// This is a static associated function, so you have to call it like
+    /// `IO::capture(action)` instead of `action.capture()`.
     pub fn capture (IO (inner): IO<'_>) -> Result<String> {
         // We only have to perform an action when `inner` is [`Eval`].
         let mut action = match inner {
-            Done | Pure (_) => return Ok ("".to_string()),
-            Eval (action) => action,
+            Expended | Pure (_) => return Ok ("".to_string()),
+            Chain (action) => action,
         };
 
         let mut buf = Vec::new();
@@ -107,7 +115,7 @@ where
     pub (crate) fn new (
         action: impl Action<'a, Output = O> + 'a
     ) -> IO<'a, O> {
-        IO (Eval (Box::new(action)))
+        IO (Chain (Box::new(action)))
     }
 
     /// Make it easier to define new relatively simple actions
@@ -141,9 +149,34 @@ where
     }
 
     /// Perform a monadic binding operation. For the IO monad, this
-    /// means simply sequencing `self` to happen before calling `f`
-    /// on the result and then performing the value returned from
-    /// `f`.
+    /// means performing `self`, calling `f` on the result and then
+    /// performing the [`IO`] actions returned from `f`.
+    ///
+    /// You can think of this as the [`IO`] version of [`Option`]'s
+    /// [`and_then`](Option::and_then) function, except fully lazy.
+    ///
+    /// If we simplify the signatures somewhat, the similarities are
+    /// clear(er) to see:
+    ///
+    /// ```text
+    /// fn and_then <F, U> (self: Option<T>, f: F) -> Option<U>
+    /// where
+    ///     F: FnOnce (T) -> Option<U>;
+    ///
+    /// fn bind <F, U> (self: IO<T>, f: F) -> IO<U>
+    /// where
+    ///     F: FnOnce (T) -> IO<U>;
+    /// ```
+    ///
+    /// Just like how `Option`'s `and_then` merges the result of calling
+    /// the given function into the existing value, `IO`'s `bind` does the
+    /// same.
+    ///
+    /// The difference is in the merging strategy. In the case of `bind`,
+    /// a new `IO` action is created that, when performed, first performs
+    /// `self` and then uses the value produced by that, called `O` here,
+    /// as an input to the given function, `f`. This in turn returns another
+    /// instance of `IO`, which is performed immediately afterwards.
     pub fn bind <R> (self, f: impl FnOnce (O) -> IO<'a, R> + 'a) -> IO<'a, R>
     where
         R: 'a,
@@ -190,8 +223,7 @@ where
     /// Apply a function to the wrapped value.
     pub fn map <R> (self, f: impl FnOnce (O) -> R + 'a) -> IO<'a, R>
     where
-        O: 'static,
-        R: 'static,
+        R: 'a,
     {
         self.bind(|x| pure(f(x)))
     }
@@ -200,8 +232,7 @@ where
     /// the old one.
     pub fn replace <R> (self, value: R) -> IO<'a, R>
     where
-        O: 'static,
-        R: 'static,
+        R: 'a,
     {
         self.map(|_| value)
     }
@@ -210,8 +241,7 @@ where
     /// its output.
     pub fn then <R> (self, other: IO<'a, R>) -> IO<'a, R>
     where
-        O: 'static,
-        R: 'static,
+        R: 'a,
     {
         self.bind(|_| other)
     }
@@ -220,15 +250,14 @@ where
     /// output instead.
     pub fn ignoring <R> (self, other: IO<'a, R>) -> IO<'a, O>
     where
-        O: 'static,
-        R: 'static,
+        R: 'a,
     {
         self.bind(|v| other.replace(v))
     }
 
 }
 
-/// Wrap a value in the monad.
+/// Wrap a value in the monad without attaching any side effects.
 ///
 /// ```
 /// use iom::{ pure, println, IO };
@@ -242,30 +271,74 @@ where
 /// assert_eq!(result, "meow\n");
 /// # Ok (()) }
 /// ```
-pub fn pure <'a, T> (value: T) -> IO<'a, T> where T: 'a {
+///
+/// This can be useful in situations where you may want to do something
+/// only if a condition holds true:
+///
+/// ```
+/// use iom::{ pure, println, IO };
+///
+/// # fn main () -> std::io::Result<()> {
+/// // Prepare a IO action that returns code 0 if the input was "meow",
+/// // and if the input was something else, it prints a message and
+/// // returns 1.
+/// let f = |s| -> IO<'_, usize> {
+///     if s == "meow" {
+///         pure(0)
+///     } else {
+///         let msg = format!("Expected 'meow', got {s}");
+///         println(msg).map(|_| 1)
+///     }
+/// };
+/// 
+/// // The action needs to return `()` so we just print the
+/// // value
+/// let action = f("meow").bind(println);
+/// 
+/// // Run the action
+/// let result: usize = IO::capture(action)?.trim().parse().unwrap();
+///
+/// assert_eq!(result, 0);
+/// # Ok (()) }
+/// ```
+pub fn pure <'a, T> (value: T) -> IO<'a, T>
+where
+    T: 'a,
+{
     IO (Pure (value))
 }
 
-/// Ignore the output value of `x`.
+/// Map the output of `x` to `()`.
+///
+/// When the returned [`IO`] is performed, `x` will still be
+/// evaluated, but its output will be discarded.
+///
+/// ```
+/// use iom::{ pure, void, IO };
+///
+/// # fn main () -> std::io::Result<()> {
+/// // Passing this to `IO::run` would be invalid...
+/// let meow: IO<'_, &str> = pure("meow");
+/// // This *can* be executed, though.
+/// let action: IO<'_, ()> = void(meow);
+///
+/// IO::run(action)?;
+/// # Ok (()) }
+/// ```
+///
+/// `void(x)` is equivalent to `x.map(|_| ())` and `x.replace(())`.
 pub fn void <'a, T> (x: IO<'a, T>) -> IO<'a>
 where
-    T: 'static
+    T: 'a,
 {
     x.replace(())
 }
 
 /// Print a line to stdout.
-pub fn println (s: impl ToString) -> IO<'static> {
-    struct PrintLn (String);
-
-    impl Action<'static> for PrintLn {
-        type Output = ();
-        fn perform (&mut self, Context { o, .. }: Context<'_>) -> Result<Self::Output> {
-            writeln!(o, "{}", self.0)
-        }
-    }
-
-    IO::new(PrintLn (s.to_string()))
+pub fn println <'a> (s: impl Display + 'a) -> IO<'a> {
+    IO::from_fn(move |Context { o, .. }| {
+        writeln!(o, "{}", s)
+    })
 }
 
 /// Read a file's contents into a string.
@@ -278,7 +351,31 @@ pub fn read_file <'a> (path: impl AsRef<Path> + 'a) -> IO<'a, String> {
     })
 }
 
-/// Acquire a resource and apply a function to it.
+/// Return a function that, given another function, returns a chain of
+/// [`IO`] actions that are performed between performing `acquire` and
+/// `release`.
+///
+/// # Example
+///
+/// In the example below, `the_bracket` is a function that takes a
+/// function that takes `()` (since `println` returns `()`) and returns
+/// an instance of `IO`. Whatever that action is, the bracket we construct
+/// here guarantees that, before we run it, the message "start" will be
+/// printed, and after it has finished running, "finish" will be printed.
+/// ```
+/// use iom::{ println, bracket, IO };
+///
+/// # fn main () -> std::io::Result<()> {
+/// let the_bracket = bracket(println("start"), println("finish"));
+/// let action = the_bracket(|_| {
+///     println("busy...")
+/// });
+///
+/// let result = IO::capture(action)?;
+///
+/// assert_eq!(result, "start\nbusy...\nfinish\n");
+/// # Ok (()) }
+/// ```
 pub fn bracket <'a, I, O, F> (
     acquire: IO<'a, I>,
     release: IO<'a>,
@@ -334,7 +431,7 @@ mod tests {
 
     #[test]
     /// Test whether [`bracket`] sequences actions correctly.
-    fn sequencing_bracket () {
+    fn bracket_sequences_actions_correctly () {
         let using_bracket = {
             let first = println("first");
             let last  = println("last");
