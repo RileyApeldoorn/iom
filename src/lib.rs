@@ -1,13 +1,13 @@
 //! Lazily evaluated monadic IO actions.
 
-use std::{ io::{ Read, Result, Write }, path::Path, mem, fs };
+use std::{ io::{ Read, Result, Write }, path::Path, mem, fs, marker::PhantomData };
 use Inner::{ Eval, Pure, Done };
 
 /// A chain of lazy, composable IO actions.
-pub struct IO <O> (Inner<O>);
+pub struct IO <'a, O = ()> (Inner<'a, O>);
 
-enum Inner <O> {
-    Eval (Box<dyn Action<Output = O>>),
+enum Inner <'a, O> {
+    Eval (Box<dyn Action<'a, Output = O> + 'a>),
     Pure (O),
     Done,
 }
@@ -15,9 +15,9 @@ enum Inner <O> {
 /// Primitive for [`IO`]. This is the "unsafe", lower level interface that can be
 /// abused (if it weren't for other safety precautions such as the `Context` being
 /// private).
-trait Action {
+trait Action<'a> {
     /// The value the action will evaluate to.
-    type Output;
+    type Output: 'a;
     /// Attempts to perform an [`Action`] more than once is generally cause for
     /// panic. Unfortunately due to the way trait objects work, this is impossible
     /// to express using move semantics.
@@ -30,17 +30,10 @@ trait Action {
     fn perform (&mut self, cx: Context<'_>) -> Result<Self::Output>;
 }
 
-/// Thunks can be used to create actions without too much hassle.
-impl<F, O> Action for F where F: FnMut () -> Result<IO<O>> {
-    type Output = O;
-    fn perform (&mut self, cx: Context<'_>) -> Result<Self::Output> {
-        // Evaluate the thunk
-        let IO (mut action) = self()?;
-        action.perform(cx)
-    }
-}
-
-impl<T> Action for Inner<T> {
+impl<'a, T> Action<'a> for Inner<'a, T>
+where
+    T: 'a,
+{
     type Output = T;
     fn perform (&mut self, cx: Context<'_>) -> Result<T> {
         match mem::replace(self, Done) {
@@ -61,11 +54,11 @@ struct Context <'a> {
     e: &'a mut (dyn Write + Send + Sync),
 }
 
-impl IO<()> {
+impl IO<'_> {
     /// Perform the IO action.
     ///
     /// Note that this is a static associated function, not a method.
-    pub fn run (IO (inner): IO<()>) -> Result<()> {
+    pub fn run (IO (inner): IO<'_>) -> Result<()> {
         // We only have to perform an action when `inner` is [`Eval`].
         let mut action = match inner {
             Done | Pure (_) => return Ok (()),
@@ -78,11 +71,12 @@ impl IO<()> {
             o: &mut std::io::stdout(),
             e: &mut std::io::stderr(),
         })
+
     }
 
     /// Perform the IO action and return anything printed to stdout
     /// as a string.
-    pub fn capture (IO (inner): IO<()>) -> Result<String> {
+    pub fn capture (IO (inner): IO<'_>) -> Result<String> {
         // We only have to perform an action when `inner` is [`Eval`].
         let mut action = match inner {
             Done | Pure (_) => return Ok ("".to_string()),
@@ -105,23 +99,64 @@ impl IO<()> {
 }
 
 /// Various combinators on the IO monad.
-impl<O> IO<O> {
+impl<'a, O> IO<'a, O>
+where
+    O: 'a
+{
+
+    pub (crate) fn new (
+        action: impl Action<'a, Output = O> + 'a
+    ) -> IO<'a, O> {
+        IO (Eval (Box::new(action)))
+    }
+
+    /// Make it easier to define new relatively simple actions
+    /// without all the boilerplate.
+    pub (crate) fn from_fn (
+        f: impl FnOnce (Context<'_>) -> Result<O> + 'a
+    ) -> IO<'a, O> {
+        struct FromFn <'x, F, O> (Option<F>, PhantomData<&'x O>);
+
+        impl<'x,F, O> Action<'x> for FromFn<'x, F, O>
+        where
+            F: FnOnce (Context<'_>) -> Result<O> + 'x,
+            O: 'x,
+        {
+            type Output = O;
+
+            fn perform (&mut self, cx: Context<'_>) -> Result<Self::Output> {
+                let FromFn (f, _) = self;
+
+                // Ensure this is the first time the action is called.
+                // This is required because `F` is `FnOnce` and not `FnMut`
+                // and the borrow checker will complain about moving it if
+                // we don't use `take` or something similar.
+                let f = f.take().expect("Re-evaluation of IO action!");
+
+                f(cx)
+            }
+        }
+
+        IO::new(FromFn (Some (f), PhantomData))
+    }
 
     /// Perform a monadic binding operation. For the IO monad, this
     /// means simply sequencing `self` to happen before calling `f`
     /// on the result and then performing the value returned from
     /// `f`.
-    pub fn bind <R> (self, f: impl FnOnce (O) -> IO<R> + 'static) -> IO<R>
+    pub fn bind <R> (self, f: impl FnOnce (O) -> IO<'a, R> + 'a) -> IO<'a, R>
     where
-        O: 'static,
-        R: 'static,
+        R: 'a,
     {
         // Declare a new struct that holds the captured values
-        struct Bind <A, F> (IO<A>, Option<F>);
+        struct Bind <'c, A, F> (IO<'c, A>, Option<F>);
 
-        impl<A, F, X> Action for Bind<A, F>
+        impl<'c, 'd: 'c, A, F, X> Action<'d> for Bind<'c, A, F>
         where
-            F: FnOnce (A) -> IO<X>,
+            F: FnOnce (A) -> IO<'d, X> + 'd,
+            F::Output: 'c,
+            X: 'd,
+            A: 'c,
         {
             type Output = X;
 
@@ -153,7 +188,7 @@ impl<O> IO<O> {
     }
 
     /// Apply a function to the wrapped value.
-    pub fn map <R> (self, f: impl FnOnce (O) -> R + 'static) -> IO<R>
+    pub fn map <R> (self, f: impl FnOnce (O) -> R + 'a) -> IO<'a, R>
     where
         O: 'static,
         R: 'static,
@@ -163,7 +198,7 @@ impl<O> IO<O> {
 
     /// Replace the value currently in the monad with a new `value`, discarding
     /// the old one.
-    pub fn replace <R> (self, value: R) -> IO<R>
+    pub fn replace <R> (self, value: R) -> IO<'a, R>
     where
         O: 'static,
         R: 'static,
@@ -173,7 +208,7 @@ impl<O> IO<O> {
 
     /// Perform `self` and discard the output, then perform `other` and return
     /// its output.
-    pub fn then <R> (self, other: IO<R>) -> IO<R>
+    pub fn then <R> (self, other: IO<'a, R>) -> IO<'a, R>
     where
         O: 'static,
         R: 'static,
@@ -183,7 +218,7 @@ impl<O> IO<O> {
 
     /// Sequence `other` after `self`, but ignore its output and return `self`'s
     /// output instead.
-    pub fn ignoring <R> (self, other: IO<R>) -> IO<O>
+    pub fn ignoring <R> (self, other: IO<'a, R>) -> IO<'a, O>
     where
         O: 'static,
         R: 'static,
@@ -191,11 +226,6 @@ impl<O> IO<O> {
         self.bind(|v| other.replace(v))
     }
 
-    pub (crate) fn new (
-        action: impl Action<Output = O> + 'static
-    ) -> IO<O> {
-        IO (Eval (Box::new(action)))
-    }
 }
 
 /// Wrap a value in the monad.
@@ -212,12 +242,12 @@ impl<O> IO<O> {
 /// assert_eq!(result, "meow\n");
 /// # Ok (()) }
 /// ```
-pub fn pure <T> (value: T) -> IO<T> {
+pub fn pure <'a, T> (value: T) -> IO<'a, T> where T: 'a {
     IO (Pure (value))
 }
 
 /// Ignore the output value of `x`.
-pub fn void <T> (x: IO<T>) -> IO<()>
+pub fn void <'a, T> (x: IO<'a, T>) -> IO<'a>
 where
     T: 'static
 {
@@ -225,43 +255,49 @@ where
 }
 
 /// Print a line to stdout.
-pub fn println (s: impl ToString) -> IO<()> {
+pub fn println (s: impl ToString) -> IO<'static> {
     struct PrintLn (String);
 
-    impl Action for PrintLn {
+    impl Action<'static> for PrintLn {
         type Output = ();
         fn perform (&mut self, Context { o, .. }: Context<'_>) -> Result<Self::Output> {
             writeln!(o, "{}", self.0)
         }
     }
-    
+
     IO::new(PrintLn (s.to_string()))
 }
 
 /// Read a file's contents into a string.
-pub fn read_file (path: impl AsRef<Path> + 'static) -> IO<String> {
+pub fn read_file <'a> (path: impl AsRef<Path> + 'a) -> IO<'a, String> {
     let mut p = Some (path);
-    IO::new(move || {
+    IO::from_fn(move |_| {
         let p = p.take().expect("Re-evaluation of IO action!");
         let s = fs::read_to_string(p)?;
-        Ok (pure (s))
+        Ok (s)
     })
 }
 
 /// Acquire a resource and apply a function to it.
-pub fn bracket <I, O, F> (
-    acquire: IO<I>,
-    release: IO<()>,
-) -> impl FnOnce (F) -> IO<O>
+pub fn bracket <'a, I, O, F> (
+    acquire: IO<'a, I>,
+    release: IO<'a>,
+) -> impl FnOnce (F) -> IO<'a, O>
 where
-    F: FnOnce (I) -> IO<O> + 'static,
-    I: 'static,
+    F: FnOnce (I) -> IO<'a, O> + 'a,
+    O: 'a,
+    I: 'a,
 {
-    struct Bracket <X, G> (IO<X>, IO<()>, Option<G>);
+    struct Bracket <'b, 'c, X, G> (IO<'b, X>, IO<'c>, Option<G>);
 
-    impl<X, G, Y> Action for Bracket<X, G>
+    impl<'b, 'c, 'd, X, G, Y> Action<'d> for Bracket<'b, 'c, X, G>
     where
-        G: FnOnce (X) -> IO<Y>
+        G: FnOnce (X) -> IO<'d, Y> + 'd,
+        Y: 'd,
+        X: 'b,
+        'd: 'b,
+        'd: 'c,
+        G::Output: 'c,
     {
         type Output = Y;
 
@@ -288,6 +324,37 @@ where
             result
         }
     }
-    
+
     |f| IO::new(Bracket (acquire, release, Some (f)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    /// Test whether [`bracket`] sequences actions correctly.
+    fn sequencing_bracket () {
+        let using_bracket = {
+            let first = println("first");
+            let last  = println("last");
+            bracket (first, last) (|_| {
+                println("meow")
+            })
+        };
+
+        let using_then = {
+            let first  = println("first");
+            let second = println("meow");
+            let last   = println("last");
+            first
+                .then(second)
+                .then(last)
+        };
+
+        let result_1 = IO::capture(using_bracket).unwrap();
+        let result_2 = IO::capture(using_then).unwrap();
+
+        assert_eq!(result_1, result_2);
+    }
 }
