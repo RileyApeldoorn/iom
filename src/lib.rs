@@ -5,9 +5,11 @@ use Inner::{ Chain, Pure, Depleted };
 
 mod combinator;
 mod primitive;
+mod iterext;
 
 pub use combinator::*;
 pub use primitive::*;
+pub use iterext::*;
 
 /// A chain of lazy, composable IO actions.
 ///
@@ -111,6 +113,24 @@ struct Context <'a> {
     o: &'a mut (dyn Write + Send + Sync),
     /// Stderr
     e: &'a mut (dyn Write + Send + Sync),
+}
+
+/// Monads that an [`IO`] may be extracted from.
+///
+/// This is needed to get [`do_each`][IterExtIO::do_each] working.
+pub trait IsIO<'a, T = ()>: 'a {
+
+	/// Get the embedded IO computation.
+	fn into_io (self) -> IO<'a, T>;
+
+}
+
+impl<'a, T> IsIO<'a, T> for IO<'a, T>
+where
+    T: 'a,
+{
+    #[inline(always)]
+    fn into_io (self) -> IO<'a, T> { self }
 }
 
 impl IO<'_> {

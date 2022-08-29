@@ -1,7 +1,7 @@
 //! Useful combinators for handling and interacting with [`IO`]
 //! computations.
 
-use std::{io::Read, fmt::Display};
+use std::{ io::Read, fmt::Display, convert::identity };
 
 use super::{ IO, Context, Action, pure };
 
@@ -29,6 +29,20 @@ where
     T: 'a,
 {
     x.replace(())
+}
+
+/// Flatten [`IO`] by [`bind`]ing with [`identity`].
+///
+/// Basically, it performs any side effects of the "outer" `IO`
+/// before performing those of the "inner" `IO` and subsequently
+/// yielding the wrapped value.
+/// 
+/// [`bind`]: IO::bind
+pub fn join <'a, T> (x: IO<'a, IO<'a, T>>) -> IO<'a, T>
+where
+    T: 'a,
+{
+	x.bind(identity)
 }
 
 /// Return a function that, given another function, returns a chain of
@@ -299,6 +313,32 @@ where
             a.perform(cx)
 
         }))
+    }
+
+}
+
+impl<'a, T> IO<'a, IO<'a, T>>
+where
+    T: 'a,
+{
+
+	/// Convenience function to call [`join`] on `self`.
+    pub fn flatten (self) -> IO<'a, T> {
+		join(self)
+    }
+
+}
+
+impl<'a> IO<'a> {
+
+	/// Perform the action only if `cond` holds.
+    pub fn when (self, cond: bool) -> IO<'a> {
+		if cond { self } else { pure (()) }
+    }
+
+	/// Perform the action *unless* `cond` holds.
+    pub fn unless (self, cond: bool) -> IO<'a> {
+        self.when(!cond)
     }
 
 }
