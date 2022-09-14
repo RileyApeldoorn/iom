@@ -9,6 +9,9 @@ mod primitive;
 pub use combinator::*;
 pub use primitive::*;
 
+/// A macro that lets you use a do-notation style of programming with [`IO`] actions.
+pub use macros::io;
+
 /// A chain of lazy, composable IO actions.
 ///
 /// # Terminology
@@ -239,4 +242,16 @@ mod tests {
 
         Ok (())
     }
+
+     #[test]
+     fn io_macro () -> Result<()> {
+         let io: IO<'_> = io! {
+             _ <- read_to_string("README.md");
+             let a = "hey";
+             y <- println(a).replace("yeet");
+             println(y)
+         };
+
+         IO::run(io)
+     }
 }
