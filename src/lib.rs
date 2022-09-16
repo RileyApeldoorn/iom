@@ -1,6 +1,38 @@
 //! Lazily evaluated monadic IO actions.
+//!
+//! # Quick start
+//!
+//! `iom` supports do-notation like syntax through the [`io`] macro.
+//!
+//! ```
+//! use std::io;
+//! use iom::*; // The library is the prelude
+//!
+//! fn main () -> io::Result<()> {
+//!     // Only IO actions that yield `()` can be ran at top-level
+//!     IO::run(io! {
+//!         // Rust-style let-bindings are supported
+//!         let get_hello = pure("hello");
+//!         // Haskell-style binding syntax is also supported
+//!         hello <- get_hello;
+//!         // Side effects must be prefixed with `do`
+//!         do println(format!("{hello} there"));
+//!         // In io-blocks, `return` can be used like in Haskell
+//!         return ()
+//!     })
+//! }
+//! ```
 
-use std::{ io::{ Read, Result, Write }, mem, marker::PhantomData };
+use std::{
+    marker::PhantomData,
+    io::{
+        Result,
+        Read,
+        Write,
+    },
+    mem,
+};
+
 use Inner::{ Chain, Pure, Depleted };
 
 mod combinator;
@@ -8,6 +40,79 @@ mod primitive;
 
 pub use combinator::*;
 pub use primitive::*;
+
+/// A macro that lets you use a do-notation style of monadic composition with [`IO`] actions.
+///
+/// [Do-notation](https://en.wikibooks.org/wiki/Haskell/do_notation) is a syntax sugar in
+/// Haskell that helps with using monads in a more readable way. It desugars to a bunch of
+/// calls to [`bind`][IO::bind] and [`then`][IO::then].
+///
+/// A do-block is composed of one or more "statements". Each statement is semicolon-terminated
+/// except for the last. The result of the do-block is the value of the last expression in the
+/// block, and statements that do not interact with the output of the IO action must be prefixed
+/// with the keyword `do`:
+///
+/// ```
+/// use iom::*;
+///
+/// # fn main () -> std::io::Result<()> {
+/// let action = io! {
+///     // Extract the result of an IO
+///     x <- read_to_string("README.md");
+///     // Perform a side effect, so must use `do`
+///     do println(x);
+///     // return `IO<()>`
+///     empty
+/// };
+///
+/// IO::run(action)?;
+/// # Ok (()) }
+/// ```
+///
+/// As illustrated in the example above, there are different kinds of statements
+/// one can use in the `io!` macro. The backwards-arrow statement performs the
+/// effect on the right side and assigns it to the pattern on the left. This
+/// can be any [irrefutable pattern]. It must be semicolon-terminated and can't
+/// be used as the final expression in the do-block.
+///
+/// If you don't care about the output of an action, you can leave out the pattern
+/// and the arrow and instead prefix it with `do`. The action will still be performed.
+/// It must be an expression of type `IO<_>`. 
+///
+/// ```
+/// use iom::*;
+///
+/// # fn main () -> std::io::Result<()> {
+/// let action = io! {
+///     do println("meow");
+///     empty
+/// };
+///
+/// let result = IO::capture(action)?;
+/// assert_eq!("meow\n", result);
+/// # Ok (()) }
+/// ```
+///
+/// `return x` is transformed to `pure(x)`:
+///
+/// ```
+/// use iom::*;
+///
+/// # fn main () -> std::io::Result<()> {
+/// let action = io! {
+///     x <- return "meow";
+///     return x
+/// }.bind(println);
+///
+/// let result = IO::capture(action)?;
+/// assert_eq!("meow\n", result);
+/// # Ok (()) }
+/// ```
+///
+/// Note that this transformation does not take place in the body of a closure.
+///
+/// [irrefutable pattern]: https://doc.rust-lang.org/book/ch18-02-refutability.html
+pub use macros::io;
 
 /// A chain of lazy, composable IO actions.
 ///
@@ -19,9 +124,9 @@ pub use primitive::*;
 /// way.
 ///
 /// For example, [`read_to_string`] returns `IO<String>`, which represents the result
-/// of reading the contents of some file into a [`String`]. When `read_file`
+/// of reading the contents of some file into a [`String`]. When `read_to_string`
 /// returns, this effect has not yet happened. It only creates a [`Future`]-like
-/// promise to do the effect as soon as it is evaluated/executed/performed.
+/// promise or *instruction* to do the effect as soon as it is evaluated/executed/performed.
 ///
 /// Functions like [`read_to_string`] are referred to as "constructors" or "primitives"
 /// of `IO`. They provide core building blocks for constructing more complicated
@@ -39,20 +144,21 @@ pub use primitive::*;
 /// When executing using `capture`, on the other hand, the stdout will be captured
 /// into a string and returned.
 ///
-/// An example:
+/// An example, supposing we have a file `greeting.txt` containing the string "hey":
 ///
 /// ```
-/// use iom::{ IO, read_to_string, println, empty };
+/// use iom::*;
 ///
 /// # fn main () -> std::io::Result<()> {
-/// let action = read_to_string("test/data/hey.txt")
+/// # std::fs::write("greeting.txt", b"hey")?;
+/// let action = read_to_string("greeting.txt")
 ///     .bind(|s| {
 ///         assert_eq!("hey", s.trim());
 ///         empty
 ///     });
 ///
 /// IO::run(action)?;
-/// # Ok (()) }
+/// # std::fs::remove_file("greeting.txt") }
 /// ```
 ///
 /// [`Future`]: std::future::Future
@@ -239,4 +345,21 @@ mod tests {
 
         Ok (())
     }
+
+     #[test]
+     fn io_macro () -> Result<()> {
+         // Note that we can't use `return` because it needs `::iom` to be in scope.
+         // It's not in scope here, but we can test it in doc tests.
+         let io: IO<'_> = io! {
+             _ <- read_to_string("README.md");
+             let a = "hey";
+             y <- println(a).replace("yeet");
+             match y {
+                 "yeet" => println(y),
+                 _ => unreachable!(),
+             }
+         };
+
+         IO::run(io)
+     }
 }
